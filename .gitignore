@@ -1,0 +1,12 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+
+# Local runtime output
+*.log
