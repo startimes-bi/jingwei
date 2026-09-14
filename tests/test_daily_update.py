@@ -8,10 +8,21 @@ from src.galaxy_ceo_portal_daily_update import (
     date_ranges,
     deletion_ranges,
     parse_feishu_date,
+    read_raw_snapshot,
 )
+from src.galaxy_ceo_portal_raw_data import FeishuError, RAW_HEADERS
 
 
 class DailyUpdateTests(unittest.TestCase):
+    class SnapshotClient:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def read_range(self, _token, range_name):
+            if range_name.endswith("!A1:J1"):
+                return [RAW_HEADERS]
+            return self.rows
+
     def test_parse_native_serial_and_legacy_text(self):
         self.assertEqual(parse_feishu_date(46276), date(2026, 9, 11))
         self.assertEqual(parse_feishu_date("2026-09-11"), date(2026, 9, 11))
@@ -46,6 +57,16 @@ class DailyUpdateTests(unittest.TestCase):
             ExistingRawRow(11, date(2026, 1, 4), ("2026-01-04", "DTT", 7, "总计")),
         ]
         self.assertEqual(deletion_ranges(rows), ((10, 11), (2, 3)))
+
+    def test_snapshot_rejects_repeated_business_keys(self):
+        row = [46276, "DTT", 7, "总计", 1, 2, 3.4, 4, 5.6, 46276.5]
+        with self.assertRaises(FeishuError):
+            read_raw_snapshot(
+                self.SnapshotClient([row, row]),
+                "token",
+                {"sheet_id": "sheet", "grid_properties": {"row_count": 3}},
+                500,
+            )
 
 
 if __name__ == "__main__":

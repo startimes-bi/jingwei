@@ -47,6 +47,14 @@ from src.galaxy_ceo_portal_raw_data import (
     rows_to_values,
     write_raw_rows,
 )
+from src.galaxy_ceo_portal_reporting import (
+    date_coverage,
+    duplicate_count,
+    quality_check,
+    quality_report,
+    safe_send_timer_report,
+    spreadsheet_url,
+)
 
 
 LOG = logging.getLogger("galaxy_ceo_portal_daily_update")
@@ -140,6 +148,32 @@ def parse_int_cell(value: Any, label: str) -> int:
     return int(number)
 
 
+def validate_metric_cells(row: Sequence[Any], row_number: int) -> None:
+    """Validate existing Feishu metric cells without treating legitimate blanks as zero."""
+
+    for column_index in (4, 5, 7):
+        if len(row) <= column_index or row[column_index] in (None, ""):
+            continue
+        label = f"metric column {column_index + 1} at row {row_number}"
+        try:
+            value = Decimal(str(row[column_index]))
+        except (InvalidOperation, ValueError) as exc:
+            raise UpdateError(f"{label} is not numeric: {row[column_index]!r}") from exc
+        if not value.is_finite() or value != value.to_integral_value():
+            raise UpdateError(f"{label} is not a finite integer: {row[column_index]!r}")
+
+    for column_index in (6, 8):
+        if len(row) <= column_index or row[column_index] in (None, ""):
+            continue
+        label = f"metric column {column_index + 1} at row {row_number}"
+        try:
+            value = Decimal(str(row[column_index]))
+        except (InvalidOperation, ValueError) as exc:
+            raise UpdateError(f"{label} is not numeric: {row[column_index]!r}") from exc
+        if not value.is_finite():
+            raise UpdateError(f"{label} is not a finite number: {row[column_index]!r}")
+
+
 def existing_key(row: Sequence[Any], row_number: int) -> tuple[date, RawKey]:
     if len(row) < 4 or row[0] in (None, ""):
         raise UpdateError(f"raw row {row_number} has no date")
@@ -160,7 +194,7 @@ def read_raw_snapshot(
     sheet: Mapping[str, Any],
     batch_size: int,
 ) -> RawSnapshot:
-    """Read only A:D to identify existing rows, dates, and append keys."""
+    """Read and validate the raw sheet's keys and metric cells."""
 
     header = client.read_range(spreadsheet_token, f"{sheet['sheet_id']}!A1:J1")
     if header != [RAW_HEADERS]:
@@ -170,10 +204,11 @@ def read_raw_snapshot(
         raise FeishuError("raw sheet is too large to scan safely")
     batch_size = min(max(batch_size, 1), DEFAULT_BATCH_SIZE)
     rows: list[ExistingRawRow] = []
+    seen_keys: dict[RawKey, int] = {}
     first_blank_row: int | None = None
     for offset in range(2, max(row_count, 2) + 1, batch_size):
         last_row = min(max(row_count, 2), offset + batch_size - 1)
-        values = client.read_range(spreadsheet_token, f"{sheet['sheet_id']}!A{offset}:D{last_row}")
+        values = client.read_range(spreadsheet_token, f"{sheet['sheet_id']}!A{offset}:J{last_row}")
         for index in range(last_row - offset + 1):
             row_number = offset + index
             row = list(values[index]) if index < len(values) else []
@@ -186,6 +221,13 @@ def read_raw_snapshot(
                     f"raw sheet has a blank row before non-empty row {row_number}; refusing to update"
                 )
             business_date, key = existing_key(row, row_number)
+            validate_metric_cells(row, row_number)
+            if key in seen_keys:
+                raise FeishuError(
+                    f"raw sheet has duplicate business key {key!r} at rows "
+                    f"{seen_keys[key]} and {row_number}"
+                )
+            seen_keys[key] = row_number
             rows.append(ExistingRawRow(row_number, business_date, key))
     return RawSnapshot(
         rows=tuple(rows),
@@ -261,6 +303,56 @@ def missing_source_rows(
     return missing
 
 
+def verify_post_write(
+    client: FeishuClient,
+    spreadsheet_token: str,
+    batch_size: int,
+    expected_keys: Iterable[RawKey],
+    expected_rows: int,
+    expected_title: str,
+    target_start: date,
+    target_end: date,
+) -> dict[str, Any]:
+    """Re-scan the target after mutation and prove keys, row count, and title."""
+
+    refreshed_sheet = find_raw_sheet(client, spreadsheet_token)
+    snapshot = read_raw_snapshot(client, spreadsheet_token, refreshed_sheet, batch_size)
+    actual_keys = set(snapshot.keys)
+    expected_key_set = set(expected_keys)
+    if actual_keys != expected_key_set:
+        missing = sorted(expected_key_set - actual_keys)
+        extra = sorted(actual_keys - expected_key_set)
+        raise FeishuError(
+            "post-write raw key verification failed: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+    if snapshot.data_rows != expected_rows:
+        raise FeishuError(
+            f"post-write raw row-count verification failed: "
+            f"expected={expected_rows}, actual={snapshot.data_rows}"
+        )
+    coverage = date_coverage(snapshot.dates, target_start, target_end)
+    if coverage["status"] != "passed":
+        raise FeishuError(
+            "post-write raw date coverage verification failed: "
+            f"missing={coverage['missing_dates']}, extra={coverage['extra_dates']}"
+        )
+    actual_title = client.spreadsheet_title(spreadsheet_token)
+    if actual_title != expected_title:
+        raise FeishuError(
+            f"post-write spreadsheet title verification failed: "
+            f"expected={expected_title!r}, actual={actual_title!r}"
+        )
+    return {
+        "status": "passed",
+        "data_rows": snapshot.data_rows,
+        "max_date": snapshot.max_date.isoformat() if snapshot.max_date else None,
+        "date_coverage": coverage,
+        "duplicate_business_keys": 0,
+        "title": actual_title,
+    }
+
+
 def deletion_ranges(
     expired_rows: Sequence[ExistingRawRow],
     max_rows_per_request: int = 5_000,
@@ -325,9 +417,22 @@ def apply_update(
     now: datetime,
     batch_size: int,
     dry_run: bool,
+    quality_checks: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     append_rows = missing_source_rows(source_rows, snapshot.keys)
     expired_ranges = deletion_ranges(plan.expired_rows)
+    expired_keys = {row.key for row in plan.expired_rows}
+    expected_keys = (set(snapshot.keys) - expired_keys) | {
+        source_key(row) for row in append_rows
+    }
+    checks = list(quality_checks or ())
+    checks.append(
+        quality_check(
+            "待写入键唯一性",
+            "passed",
+            f"本次来源 {len(source_rows)} 行，待新增键 {len(append_rows)} 个，无重复键。",
+        )
+    )
     result: dict[str, Any] = {
         "target_start_date": plan.target_start.isoformat(),
         "target_end_date": plan.target_end.isoformat(),
@@ -339,6 +444,8 @@ def apply_update(
     }
     if dry_run:
         result["dry_run"] = True
+        checks.append(quality_check("写入后回读", "skipped", "dry-run 未执行写入，因此未做回读。"))
+        result["quality"] = quality_report(checks)
         return result
 
     for start_row, end_row in expired_ranges:
@@ -364,6 +471,32 @@ def apply_update(
     new_title = f"{SPREADSHEET_TITLE_PREFIX} {now.astimezone(BJ_TZ):%Y-%m-%d %H:%M}"
     client.rename_spreadsheet(spreadsheet_token, new_title)
     result["title"] = new_title
+    result["verification"] = verify_post_write(
+        client,
+        spreadsheet_token,
+        batch_size,
+        expected_keys,
+        len(expected_keys),
+        new_title,
+        plan.target_start,
+        plan.target_end,
+    )
+    checks.append(
+        quality_check(
+            "写入后回读",
+            "passed",
+            f"表头、键集合、行数（{len(expected_keys)}）和标题均已复核。",
+        )
+    )
+    coverage = result["verification"]["date_coverage"]
+    checks.append(
+        quality_check(
+            "日期覆盖与业务键不重复",
+            "passed",
+            f"目标窗口 {coverage['expected_days']} 天全部存在，重复业务键 0 个。",
+        )
+    )
+    result["quality"] = quality_report(checks)
     return result
 
 
@@ -379,7 +512,7 @@ def update_once(
     now = now or datetime.now(BJ_TZ)
     now = now.astimezone(BJ_TZ)
     client = FeishuClient(config)
-    client.validate_spreadsheet_title(spreadsheet_token)
+    current_title = client.validate_spreadsheet_title(spreadsheet_token)
     raw_sheet = find_raw_sheet(client, spreadsheet_token)
     # This read intentionally precedes the database readiness check.
     snapshot = read_raw_snapshot(client, spreadsheet_token, raw_sheet, batch_size)
@@ -398,11 +531,69 @@ def update_once(
             "feishu_max_date": snapshot.max_date.isoformat() if snapshot.max_date else None,
             "source_latest_date": source_latest.isoformat(),
             "expected_yesterday": yesterday.isoformat(),
+            "document": {
+                "title": current_title,
+                "url": spreadsheet_url(config, spreadsheet_token),
+                "status": "未更新（数据源未就绪）",
+            },
+            "quality": quality_report(
+                [
+                    quality_check(
+                        "飞书目标表结构",
+                        "passed",
+                        f"表头、空行、日期、业务、公司 ID、节目包和指标类型检查通过，共 {snapshot.data_rows} 行。",
+                    ),
+                    quality_check(
+                        "数据库时效性",
+                        "failed",
+                        f"数据库最新日期 {source_latest.isoformat()} 未达到期望日期 {yesterday.isoformat()}。",
+                    ),
+                    quality_check("写入保护", "passed", "数据源未就绪，未执行删除、追加或改名。"),
+                ]
+            ),
         }
 
     target_end = min(source_latest, yesterday)
     plan = build_update_plan(snapshot, target_end, retention_days)
     source_rows = fetch_source_rows(config, plan.fetch_ranges, query_chunk_days)
+    source_duplicate_count = duplicate_count([source_key(row) for row in source_rows])
+    if source_duplicate_count:
+        raise DataQualityError(
+            f"database result contains {source_duplicate_count} duplicate business keys; refusing to write"
+        )
+    append_rows = missing_source_rows(source_rows, snapshot.keys)
+    expired_keys = {row.key for row in plan.expired_rows}
+    planned_dates = {row.business_date for row in snapshot.rows if row.key not in expired_keys}
+    planned_dates.update(date.fromisoformat(str(row["date"])) for row in append_rows)
+    planned_coverage = date_coverage(planned_dates, plan.target_start, plan.target_end)
+    if planned_coverage["status"] != "passed":
+        raise DataQualityError(
+            "planned raw date coverage is incomplete or contains out-of-window dates: "
+            f"missing={planned_coverage['missing_dates']}, extra={planned_coverage['extra_dates']}"
+        )
+    checks = [
+        quality_check(
+            "数据库时效性",
+            "passed",
+            f"数据库共同最新日期 {source_latest.isoformat()} 已达到北京时间昨日 {yesterday.isoformat()}。",
+        ),
+        quality_check(
+            "飞书目标表结构",
+            "passed",
+            f"表头、空行、日期、业务、公司 ID、节目包和指标类型检查通过，共 {snapshot.data_rows} 行。",
+        ),
+        quality_check(
+            "来源指标一致性",
+            "passed",
+            f"五项指标已按固定口径读取并完成类型/冲突检查，共 {len(source_rows)} 行。",
+        ),
+        quality_check("来源业务键唯一性", "passed", "数据库结果未发现重复业务键。"),
+        quality_check(
+            "日期覆盖与业务键不重复",
+            "passed",
+            f"目标窗口 {planned_coverage['expected_days']} 天全部覆盖，数据库/飞书业务键重复 0 个。",
+        ),
+    ]
     result = apply_update(
         client,
         spreadsheet_token,
@@ -413,8 +604,19 @@ def update_once(
         now,
         batch_size,
         dry_run,
+        quality_checks=checks,
     )
-    result.update({"ready": True, "source_latest_date": source_latest.isoformat()})
+    result.update(
+        {
+            "ready": True,
+            "source_latest_date": source_latest.isoformat(),
+            "document": {
+                "title": result.get("title", current_title),
+                "url": spreadsheet_url(config, spreadsheet_token),
+                "status": "未写入（dry-run）" if dry_run else "已更新",
+            },
+        }
+    )
     return result
 
 
@@ -429,8 +631,40 @@ def run_with_retries(args: argparse.Namespace) -> int:
         raise ConfigurationError(
             "--spreadsheet-token or GALAXY_CEO_PORTAL_SPREADSHEET_TOKEN is required"
         )
+    started_at = time.monotonic()
+    max_attempts = args.max_retries + 1
     last_result: dict[str, Any] | None = None
+
+    def notify(
+        result: Mapping[str, Any] | None,
+        attempts: int,
+        error: BaseException | None = None,
+    ) -> dict[str, str]:
+        if args.dry_run:
+            return {"status": "skipped", "reason": "dry_run"}
+        report_result = dict(result or {})
+        report_result.setdefault("ready", False)
+        report_result.setdefault(
+            "document",
+            {
+                "title": "目标表未确认",
+                "url": spreadsheet_url(config, spreadsheet_token),
+                "status": "未更新（质检或读取失败）",
+            },
+        )
+        return safe_send_timer_report(
+            config,
+            "节目包",
+            report_result,
+            attempts,
+            max_attempts,
+            time.monotonic() - started_at,
+            error=error,
+            logger=LOG,
+        )
+
     for attempt in range(args.max_retries + 1):
+        attempts_done = attempt + 1
         LOG.info("daily update attempt %d/%d", attempt + 1, args.max_retries + 1)
         try:
             result = update_once(
@@ -443,6 +677,11 @@ def run_with_retries(args: argparse.Namespace) -> int:
             )
             last_result = result
             if result.get("ready"):
+                result = dict(result)
+                result["attempts"] = attempts_done
+                result["max_attempts"] = max_attempts
+                result["duration_seconds"] = round(time.monotonic() - started_at, 3)
+                result["notification"] = notify(result, attempts_done)
                 print(json.dumps(result, ensure_ascii=False))
                 return 0
             LOG.warning(
@@ -451,15 +690,21 @@ def run_with_retries(args: argparse.Namespace) -> int:
             )
         except (FeishuError, pymysql.MySQLError, requests.RequestException) as exc:
             if attempt >= args.max_retries:
+                notify(last_result, attempts_done, exc)
                 raise
             LOG.warning("transient update failure: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - fatal data errors must still be reported.
+            notify(last_result, attempts_done, exc)
+            raise
         if attempt < args.max_retries:
             LOG.info("sleeping %s seconds before the next attempt", args.retry_interval_seconds)
             time.sleep(args.retry_interval_seconds)
-    raise UpdateError(
+    failure = UpdateError(
         "database did not reach yesterday after the configured retries; "
         f"last_result={last_result}"
     )
+    notify(last_result, max_attempts, failure)
+    raise failure
 
 
 @contextmanager

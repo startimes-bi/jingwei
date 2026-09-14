@@ -11,6 +11,8 @@
 3. 大区表的窗口策略确定为：数据库共同最新日期所在月份的上一个月 1 日，到北京时间昨日；不采用固定 400 天保留策略。
 4. 两个 pipeline 都保留数据库明确提供的总计行，不把大区或城市明细相加替代总计。
 5. 大区表的公司/大区对应表和汇率税率表作为参考 Sheet 保留；日常原始数据更新器不覆盖这两个参考 Sheet。
+6. 两个日更入口均向 `BI Plus Reporting` 发送成功/失败卡片；卡片包含产出表格链接、表格状态、执行动作和轻量质检摘要。
+7. 日更质检至少覆盖数据库时效、表头/空行/字段类型、日期窗口完整性、完整业务键不重复、来源指标冲突以及写入后回读；大区任务额外核对公司总计与大区行。
 
 ### 大区表初始验收
 
@@ -37,10 +39,11 @@
 - 大区每日更新：`src/galaxy_ceo_portal_region_daily_update.py`。
 - 大区测试：`tests/test_region_daily_update.py`。
 - 大区部署模板：`deploy/systemd/galaxy-ceo-portal-region-update.service`、`deploy/systemd/galaxy-ceo-portal-region-update.timer`。
-- 最近一次验证：全量测试 15 项通过，两个大区 Python 入口编译通过，systemd timer 语法和日历表达式校验通过。
+- 最近一次验证：全量测试 25 项通过，两个 Python 入口编译通过；通知发送为尽力而为，失败只记日志，不阻断数据任务。
 
 ## 后续维护约束
 
 - 任何调整前先区分节目包 pipeline 与大区 pipeline，不共用表格 token，也不要把一个 pipeline 的窗口策略复制到另一个。
 - 修改指标、SQL 筛选条件或字段含义时，先更新对应产品文档和测试，再执行 dry-run；禁止用城市/大区求和掩盖源数据总计差异。
 - 参考数据（公司、大区、汇率、税率）发生变化时，单独记录来源、有效期和更新时间，不把它混入原始数据日更任务。
+- Reporting 配置使用 `FEISHU_REPORTING_CHAT_NAME`（默认 `BI Plus Reporting`）和 `FEISHU_SPREADSHEET_BASE_URL`；两者均为非密钥配置，App 密钥仍只从受控 env 文件读取。

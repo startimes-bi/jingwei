@@ -608,12 +608,13 @@ class FeishuClient:
             raise FeishuError("Feishu spreadsheet metadata did not contain a title")
         return str(title)
 
-    def validate_spreadsheet_title(self, spreadsheet_token: str) -> None:
+    def validate_spreadsheet_title(self, spreadsheet_token: str) -> str:
         title = self.spreadsheet_title(spreadsheet_token)
         if not SPREADSHEET_TITLE_PATTERN.fullmatch(title):
             raise FeishuError(
                 f"spreadsheet title does not match the expected prefix/time format; refusing to alter it"
             )
+        return title
 
     def rename_spreadsheet(self, spreadsheet_token: str, title: str) -> None:
         if not SPREADSHEET_TITLE_PATTERN.fullmatch(title):
