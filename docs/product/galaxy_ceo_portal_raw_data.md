@@ -103,7 +103,7 @@ AND sale_area_id IS NULL
 5. 删除窗口起始日前的旧行，再把窗口维持在最近 400 个自然日；数据库仍为只读连接。
 6. 成功后更新电子表格名称的北京时间后缀；表格 token 不变。
 
-服务调度模板位于 `deploy/systemd/`。当前运行环境没有可用的 user systemd bus，因此这里只提交可部署模板，安装时将 service 和 timer 复制到 `~/.config/systemd/user/` 后执行 `systemctl --user daemon-reload && systemctl --user enable --now galaxy-ceo-portal-update.timer`。
+服务调度模板位于 `deploy/systemd/`。本机已将节目包 pipeline 的 service/timer 安装到用户级 systemd 并启用；迁移到其他环境时，仍需将对应模板复制到 `~/.config/systemd/user/`，执行 `systemctl --user daemon-reload`，再启用 `galaxy-ceo-portal-update.timer`。大区 pipeline 的独立规则和调度见 [`galaxy_ceo_portal_region_data.md`](galaxy_ceo_portal_region_data.md)。
 - 初次装载要求目标 Sheet 为空；程序发现已有数据时应停止，避免重复追加。清理旧数据必须由人工明确执行。
 
 ## 验收标准

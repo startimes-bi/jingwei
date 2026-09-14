@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Galaxy CEO Portal MGW region update daily at Beijing 15:55
+
+[Timer]
+OnCalendar=*-*-* 15:55:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=galaxy-ceo-portal-region-update.service
+
+[Install]
+WantedBy=timers.target
