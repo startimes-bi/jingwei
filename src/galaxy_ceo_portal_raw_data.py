@@ -232,11 +232,11 @@ def values_equal(left: Any, right: Any, money: bool) -> bool:
 def is_reconciled_zero_total_placeholder(
     spec: MetricSpec,
     raw: Mapping[str, Any],
-    package_detail_totals: Mapping[tuple[Any, Any, Any], Decimal],
+    package_detail_totals: Mapping[tuple[Any, ...], Decimal],
 ) -> bool:
     """Recognize the observed recharge-money zero placeholder only after reconciliation."""
 
-    if spec.name != "recharge_money" or raw["package_class"] is not None:
+    if spec.name != "recharge_money" or raw.get("package_class") is not None:
         return False
     if int(raw["source_rows"]) != 2 or int(raw["populated_values"]) != 2:
         return False
@@ -244,8 +244,11 @@ def is_reconciled_zero_total_placeholder(
     maximum = money_value(raw["max_value"])
     if minimum != Decimal("0.00") or maximum is None or maximum <= Decimal("0.00"):
         return False
-    key = (raw["load_date"], raw["business"], raw["company_id"])
+    base_key = (raw["load_date"], raw["business"], raw["company_id"])
+    key = (*base_key, raw["region_id"]) if "region_id" in raw else base_key
     detail_total = package_detail_totals.get(key)
+    if detail_total is None and key != base_key:
+        detail_total = package_detail_totals.get(base_key)
     return detail_total is not None and abs(detail_total - maximum) <= MONEY_QUANT
 
 

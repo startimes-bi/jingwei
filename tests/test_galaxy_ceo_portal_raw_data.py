@@ -51,6 +51,23 @@ class GalaxyCeoPortalTests(unittest.TestCase):
         self.assertTrue(is_reconciled_zero_total_placeholder(spec, raw, {key: Decimal("761.76")}))
         self.assertFalse(is_reconciled_zero_total_placeholder(spec, raw, {key: Decimal("761.74")}))
 
+    def test_zero_recharge_region_total_is_allowed_only_after_region_detail_reconciliation(self):
+        spec = next(metric for metric in METRICS if metric.name == "recharge_money")
+        raw = {
+            "load_date": "20251110",
+            "business": "DTT",
+            "company_id": 2,
+            "region_id": 4,
+            "package_class": None,
+            "source_rows": 2,
+            "populated_values": 2,
+            "min_value": 0.0,
+            "max_value": 607.67,
+        }
+        key = ("20251110", "DTT", 2, 4)
+        self.assertTrue(is_reconciled_zero_total_placeholder(spec, raw, {key: Decimal("607.67")}))
+        self.assertFalse(is_reconciled_zero_total_placeholder(spec, raw, {key: Decimal("607.65")}))
+
     def test_timestamp_uses_beijing_wall_clock(self):
         value = datetime(2026, 9, 13, 12, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
         self.assertAlmostEqual(feishu_datetime_serial(value), 46278.50486111111)

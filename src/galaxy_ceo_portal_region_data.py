@@ -30,6 +30,7 @@ try:
         date_chunks,
         feishu_date_serial,
         feishu_datetime_serial,
+        is_reconciled_zero_total_placeholder,
         load_runtime_config,
         normalize_metric_value,
         required,
@@ -47,6 +48,7 @@ except ModuleNotFoundError:  # Supports importing this pipeline as src.galaxy_ce
         date_chunks,
         feishu_date_serial,
         feishu_datetime_serial,
+        is_reconciled_zero_total_placeholder,
         load_runtime_config,
         normalize_metric_value,
         required,
@@ -159,6 +161,140 @@ def load_date_iso(value: Any) -> str:
     return f"{text[:4]}-{text[4:6]}-{text[6:]}"
 
 
+def _recharge_package_detail_totals(
+    cursor: Any,
+    spec: MetricSpec,
+    chunk_start: date,
+    chunk_end: date,
+) -> dict[tuple[str, str, int, int | None], Decimal]:
+    """Read package detail totals used to verify a zero total placeholder."""
+
+    sql = (
+        f"SELECT load_date, business, company_id, region_id, package_class, "
+        f"COUNT({spec.value_column}) AS populated_values, "
+        f"MIN({spec.value_column}) AS min_value, MAX({spec.value_column}) AS max_value "
+        f"FROM {spec.table} "
+        f"WHERE load_date BETWEEN %s AND %s "
+        f"AND business IN (%s, %s) "
+        f"AND company_id IS NOT NULL "
+        f"AND sale_area_id IS NULL "
+        f"AND package_class IS NOT NULL "
+        f"AND {spec.breakdown_filter} "
+        f"GROUP BY load_date, business, company_id, region_id, package_class "
+        f"ORDER BY load_date, business, company_id, region_id, package_class"
+    )
+    cursor.execute(
+        sql,
+        (
+            chunk_start.strftime("%Y%m%d"),
+            chunk_end.strftime("%Y%m%d"),
+            *BUSINESSES,
+        ),
+    )
+    totals: dict[tuple[str, str, int, int | None], Decimal] = {}
+    for raw in cursor.fetchall():
+        populated = int(raw["populated_values"])
+        if populated and not values_equal(raw["min_value"], raw["max_value"], spec.money):
+            raise DataQualityError(
+                f"conflicting {spec.name} package-detail values in {spec.table}: "
+                f"{raw['load_date']}/{raw['business']}/{raw['company_id']}/"
+                f"{raw['region_id']}/{raw['package_class']} has "
+                f"{raw['min_value']} and {raw['max_value']}"
+            )
+        value = normalize_metric_value(spec, raw["max_value"] if populated else None)
+        if value is None:
+            continue
+        key = (
+            str(raw["load_date"]),
+            str(raw["business"]),
+            int(raw["company_id"]),
+            None if raw["region_id"] is None else int(raw["region_id"]),
+        )
+        totals[key] = totals.get(key, Decimal("0.00")) + Decimal(str(value))
+    return totals
+
+
+def _legacy_new_user_totals(
+    cursor: Any,
+    chunk_start: date,
+    chunk_end: date,
+) -> dict[tuple[str, str, int], int]:
+    """Read legacy company totals used to verify a v2 zero placeholder."""
+
+    sql = (
+        "SELECT load_date, business, company_id, "
+        "COUNT(*) AS source_rows, COUNT(`sub_day_new_count`) AS populated_values, "
+        "MIN(`sub_day_new_count`) AS min_value, MAX(`sub_day_new_count`) AS max_value "
+        "FROM `metric_sub_new_count` "
+        "WHERE load_date BETWEEN %s AND %s "
+        "AND business IN (%s, %s) "
+        "AND company_id IS NOT NULL "
+        "AND region_id IS NULL "
+        "AND sale_area_id IS NULL "
+        "AND package_class IS NULL "
+        "AND fta_flag IS NULL "
+        "AND wct_flag IS NULL "
+        "AND tv_class IS NULL "
+        "GROUP BY load_date, business, company_id "
+        "ORDER BY load_date, business, company_id"
+    )
+    cursor.execute(
+        sql,
+        (
+            chunk_start.strftime("%Y%m%d"),
+            chunk_end.strftime("%Y%m%d"),
+            *BUSINESSES,
+        ),
+    )
+    spec = REGION_METRICS[0]
+    totals: dict[tuple[str, str, int], int] = {}
+    for raw in cursor.fetchall():
+        populated = int(raw["populated_values"])
+        if populated and not values_equal(raw["min_value"], raw["max_value"], False):
+            raise DataQualityError(
+                "conflicting legacy new-user values in metric_sub_new_count: "
+                f"{raw['load_date']}/{raw['business']}/{raw['company_id']} has "
+                f"{raw['min_value']} and {raw['max_value']}"
+            )
+        value = normalize_metric_value(spec, raw["max_value"] if populated else None)
+        if value is None:
+            continue
+        key = (load_date_iso(raw["load_date"]), str(raw["business"]), int(raw["company_id"]))
+        totals[key] = int(value)
+    return totals
+
+
+def _reconcile_new_user_placeholders(
+    merged: Mapping[tuple[str, str, int, int | None], dict[str, Any]],
+    legacy_totals: Mapping[tuple[str, str, int], int],
+) -> None:
+    """Use a legacy company total only when it exactly matches region details."""
+
+    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for key, row in merged.items():
+        grouped[key[:3]].append(row)
+    for group_key, group_rows in grouped.items():
+        total = next((row for row in group_rows if row["region_id"] is None), None)
+        regions = [row for row in group_rows if row["region_id"] is not None]
+        if total is None or total.get("new_users") != 0 or not regions:
+            continue
+        legacy_total = legacy_totals.get(group_key)
+        region_values = [row.get("new_users") for row in regions]
+        if (
+            legacy_total is None
+            or legacy_total <= 0
+            or any(value is None for value in region_values)
+            or sum(region_values) != legacy_total
+        ):
+            continue
+        total["new_users"] = legacy_total
+        LOG.warning(
+            "using the legacy new-user company total after matching region details; "
+            "discarding an upstream v2 zero placeholder for key %r",
+            group_key,
+        )
+
+
 def collect_rows(
     config: Mapping[str, str],
     start: date,
@@ -172,6 +308,11 @@ def collect_rows(
             for chunk_start, chunk_end in date_chunks(start, end, chunk_days):
                 LOG.info("querying region pipeline chunk %s through %s", chunk_start, chunk_end)
                 for spec in REGION_METRICS:
+                    package_detail_totals: dict[tuple[Any, ...], Decimal] = {}
+                    if spec.name == "recharge_money":
+                        package_detail_totals = _recharge_package_detail_totals(
+                            cursor, spec, chunk_start, chunk_end
+                        )
                     sql = (
                         f"SELECT load_date, business, company_id, region_id, "
                         f"COUNT(*) AS source_rows, COUNT(`{spec.value_column}`) AS populated_values, "
@@ -196,13 +337,29 @@ def collect_rows(
                     )
                     for raw in cursor.fetchall():
                         populated = int(raw["populated_values"])
+                        used_zero_placeholder = False
                         if populated and not values_equal(
                             raw["min_value"], raw["max_value"], spec.money
                         ):
-                            raise DataQualityError(
-                                f"conflicting {spec.name} values in {spec.table}: "
-                                f"{raw['load_date']}/{raw['business']}/{raw['company_id']}/"
-                                f"{raw['region_id']} has {raw['min_value']} and {raw['max_value']}"
+                            used_zero_placeholder = is_reconciled_zero_total_placeholder(
+                                spec, raw, package_detail_totals
+                            )
+                            if not used_zero_placeholder:
+                                raise DataQualityError(
+                                    f"conflicting {spec.name} values in {spec.table}: "
+                                    f"{raw['load_date']}/{raw['business']}/{raw['company_id']}/"
+                                    f"{raw['region_id']} has {raw['min_value']} and {raw['max_value']}"
+                                )
+                            LOG.warning(
+                                "using the non-zero recharge-money total after matching "
+                                "package details; discarding an upstream zero placeholder "
+                                "for region key %r",
+                                (
+                                    raw["load_date"],
+                                    raw["business"],
+                                    raw["company_id"],
+                                    raw["region_id"],
+                                ),
                             )
                         key = (
                             load_date_iso(raw["load_date"]),
@@ -228,6 +385,14 @@ def collect_rows(
                                 f"duplicate merged value for {key!r}, metric {spec.name}"
                             )
                         row[spec.name] = value
+                if any(
+                    key[3] is None and row.get("new_users") == 0
+                    for key, row in merged.items()
+                ):
+                    _reconcile_new_user_placeholders(
+                        merged,
+                        _legacy_new_user_totals(cursor, chunk_start, chunk_end),
+                    )
     finally:
         connection.close()
 
