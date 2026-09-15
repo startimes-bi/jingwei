@@ -9,4 +9,4 @@ WorkingDirectory=/home/wangzp/projects/jingwei
 EnvironmentFile=/home/wangzp/projects/jingwei/.env
 Environment=PYTHONUNBUFFERED=1
 TimeoutStartSec=4h
-ExecStart=/usr/bin/python3 /home/wangzp/projects/jingwei/src/galaxy_ceo_portal_region_daily_update.py --max-retries 3 --retry-interval-seconds 3600 --query-chunk-days 7
+ExecStart=/usr/bin/python3 /home/wangzp/projects/jingwei/src/galaxy_ceo_portal_region_daily_update.py --retention-days 400 --max-retries 3 --retry-interval-seconds 3600 --query-chunk-days 7

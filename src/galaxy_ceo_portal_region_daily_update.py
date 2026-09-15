@@ -59,6 +59,7 @@ LOG = logging.getLogger("galaxy_ceo_portal_region_daily_update")
 FEISHU_EPOCH = date(1899, 12, 30)
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_RETRY_INTERVAL_SECONDS = 3_600
+DEFAULT_RETENTION_DAYS = 400
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_QUERY_CHUNK_DAYS = 7
 DEFAULT_LOCK_FILE = Path("/tmp/galaxy_ceo_portal_region_daily_update.lock")
@@ -260,12 +261,6 @@ def read_company_names(
     return companies
 
 
-def first_day_previous_month(value: date) -> date:
-    first_current = value.replace(day=1)
-    previous_month_end = first_current - timedelta(days=1)
-    return previous_month_end.replace(day=1)
-
-
 def iter_dates(start: date, end: date) -> Iterable[date]:
     current = start
     while current <= end:
@@ -288,8 +283,14 @@ def date_ranges(dates: Iterable[date]) -> tuple[tuple[date, date], ...]:
     return tuple(ranges)
 
 
-def build_update_plan(snapshot: RegionSnapshot, target_end: date) -> RegionUpdatePlan:
-    target_start = first_day_previous_month(target_end)
+def build_update_plan(
+    snapshot: RegionSnapshot,
+    target_end: date,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+) -> RegionUpdatePlan:
+    if retention_days < 1:
+        raise ValueError("retention_days must be positive")
+    target_start = target_end - timedelta(days=retention_days - 1)
     expected = set(iter_dates(target_start, target_end))
     missing = expected - set(snapshot.dates)
     # Always re-query the newest date so a partial batch is repaired.
@@ -463,6 +464,7 @@ def update_once(
     batch_size: int,
     now: datetime | None = None,
     dry_run: bool = False,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
 ) -> dict[str, Any]:
     now = (now or datetime.now(BJ_TZ)).astimezone(BJ_TZ)
     client = FeishuClient(config)
@@ -511,7 +513,7 @@ def update_once(
         }
 
     target_end = min(source_latest, yesterday)
-    plan = build_update_plan(snapshot, target_end)
+    plan = build_update_plan(snapshot, target_end, retention_days)
     source_rows: list[dict[str, Any]] = []
     for start, end in plan.fetch_ranges:
         source_rows.extend(
@@ -599,7 +601,7 @@ def update_once(
         "rows_to_append": len(append_rows),
         "rows_to_delete": len(plan.expired_rows),
         "delete_ranges": len(expired_ranges),
-        "window_policy": "first_day_of_month_before_source_latest_month_through_yesterday",
+        "window_policy": f"rolling_{retention_days}_natural_days_through_yesterday",
         "total_validation": total_validation,
         "missing_company_mappings": missing_company_mappings,
     }
@@ -733,6 +735,7 @@ def run_with_retries(args: argparse.Namespace) -> int:
                 args.query_chunk_days,
                 args.batch_size,
                 dry_run=args.dry_run,
+                retention_days=args.retention_days,
             )
             if last_result.get("ready"):
                 last_result = dict(last_result)
@@ -777,6 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-env", type=Path, default=Path(".env"))
     parser.add_argument("--spreadsheet-token")
+    parser.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     parser.add_argument("--query-chunk-days", type=int, default=DEFAULT_QUERY_CHUNK_DAYS)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_RETRY_COUNT)
